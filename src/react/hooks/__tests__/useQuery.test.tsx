@@ -10161,6 +10161,234 @@ describe("useQuery Hook", () => {
       check("network-only", "cache-and-network"));
   });
 
+  describe("ObservableQuery deduplication", () => {
+    it(
+      "two useQuery calls with the same query + variables share one ObservableQuery and trigger a single network request",
+      async () => {
+        type Data = { hello: string };
+        const query: TypedDocumentNode<Data, Record<string, never>> = gql`
+          query Hello {
+            hello
+          }
+        `;
+
+        let requestCount = 0;
+        const link = new ApolloLink(
+          () =>
+            new Observable((observer) => {
+              requestCount++;
+              setTimeout(() => {
+                observer.next({ data: { hello: "world" } });
+                observer.complete();
+              });
+            })
+        );
+
+        const client = new ApolloClient({
+          link,
+          cache: new InMemoryCache(),
+        });
+
+        const { result } = renderHook(
+          () => ({
+            a: useQuery(query),
+            b: useQuery(query),
+          }),
+          {
+            wrapper: ({ children }) => (
+              <ApolloProvider client={client}>{children}</ApolloProvider>
+            ),
+          }
+        );
+
+        await waitFor(() => {
+          expect(result.current.a.loading).toBe(false);
+          expect(result.current.b.loading).toBe(false);
+        });
+
+        expect(result.current.a.data).toEqual({ hello: "world" });
+        expect(result.current.b.data).toEqual({ hello: "world" });
+
+        expect(result.current.a.observable).toBe(result.current.b.observable);
+        expect(requestCount).toBe(1);
+        expect(client.getObservableQueries("active").size).toBe(1);
+      }
+    );
+
+    it("two useQuery calls with different variables get distinct ObservableQueries", async () => {
+      type Data = { user: { __typename: "User"; id: string; name: string } };
+      type Vars = { id: string };
+      const query: TypedDocumentNode<Data, Vars> = gql`
+        query GetUser($id: ID!) {
+          user(id: $id) {
+            id
+            name
+          }
+        }
+      `;
+
+      let requestCount = 0;
+      const link = new ApolloLink(
+        (op: ApolloLink.Operation) =>
+          new Observable((observer) => {
+            requestCount++;
+            const id = op.variables.id;
+            setTimeout(() => {
+              observer.next({
+                data: { user: { __typename: "User", id, name: `User ${id}` } },
+              });
+              observer.complete();
+            });
+          })
+      );
+
+      const client = new ApolloClient({
+        link,
+        cache: new InMemoryCache(),
+      });
+
+      const { result } = renderHook(
+        () => ({
+          a: useQuery(query, { variables: { id: "1" } }),
+          b: useQuery(query, { variables: { id: "2" } }),
+        }),
+        {
+          wrapper: ({ children }) => (
+            <ApolloProvider client={client}>{children}</ApolloProvider>
+          ),
+        }
+      );
+
+      await waitFor(() => {
+        expect(result.current.a.loading).toBe(false);
+        expect(result.current.b.loading).toBe(false);
+      });
+
+      expect(result.current.a.observable).not.toBe(result.current.b.observable);
+      expect(requestCount).toBe(2);
+      expect(client.getObservableQueries("active").size).toBe(2);
+    });
+
+    it("queryKey opts a consumer out of sharing", async () => {
+      type Data = { hello: string };
+      const query: TypedDocumentNode<Data, Record<string, never>> = gql`
+        query Hello {
+          hello
+        }
+      `;
+
+      let requestCount = 0;
+      const link = new ApolloLink(
+        () =>
+          new Observable((observer) => {
+            requestCount++;
+            setTimeout(() => {
+              observer.next({ data: { hello: "world" } });
+              observer.complete();
+            });
+          })
+      );
+
+      const client = new ApolloClient({
+        link,
+        cache: new InMemoryCache(),
+      });
+
+      const { result } = renderHook(
+        () => ({
+          a: useQuery<Data, Record<string, never>>(query),
+          // Unique queryKey to get its own ObservableQuery + network request
+          b: useQuery<Data, Record<string, never>>(query, {
+            queryKey: "isolated",
+          }),
+        }),
+        {
+          wrapper: ({ children }) => (
+            <ApolloProvider client={client}>{children}</ApolloProvider>
+          ),
+        }
+      );
+
+      await waitFor(() => {
+        expect(result.current.a.loading).toBe(false);
+        expect(result.current.b.loading).toBe(false);
+      });
+
+      expect(result.current.a.observable).not.toBe(result.current.b.observable);
+      expect(client.getObservableQueries("active").size).toBe(2);
+    });
+
+    it("releases the shared ObservableQuery once the last consumer unmounts", async () => {
+      type Data = { hello: string };
+      const query: TypedDocumentNode<Data, Record<string, never>> = gql`
+        query Hello {
+          hello
+        }
+      `;
+
+      const link = new ApolloLink(
+        () =>
+          new Observable((observer) => {
+            setTimeout(() => {
+              observer.next({ data: { hello: "world" } });
+              observer.complete();
+            });
+          })
+      );
+
+      const client = new ApolloClient({
+        link,
+        cache: new InMemoryCache(),
+      });
+      type QueryResult = ReturnType<
+        typeof useQuery<Data, Record<string, never>>
+      >;
+      const aResult: { current: QueryResult | null } = { current: null };
+      const bResult: { current: QueryResult | null } = { current: null };
+      function ConsumerA() {
+        aResult.current = useQuery<Data, Record<string, never>>(query);
+        return null;
+      }
+      function ConsumerB() {
+        bResult.current = useQuery<Data, Record<string, never>>(query);
+        return null;
+      }
+
+      const { rerender, unmount } = render(
+        <ApolloProvider client={client}>
+          <ConsumerA />
+          <ConsumerB />
+        </ApolloProvider>
+      );
+
+      await waitFor(() => {
+        expect(aResult.current?.loading).toBe(false);
+        expect(bResult.current?.loading).toBe(false);
+      });
+
+      expect(client.getObservableQueries("active").size).toBe(1);
+      const sharedObservable = aResult.current!.observable;
+      expect(bResult.current!.observable).toBe(sharedObservable);
+
+      rerender(
+        <ApolloProvider client={client}>
+          <ConsumerA />
+        </ApolloProvider>
+      );
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
+      expect(client.getObservableQueries("active").size).toBe(1);
+      expect(aResult.current!.observable).toBe(sharedObservable);
+
+      unmount();
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 0));
+      });
+      expect(client.getObservableQueries("active").size).toBe(0);
+    });
+  });
+
   describe("regression test issue #9204", () => {
     // TODO: See if we can rewrite this with renderHookToSnapshotStream and
     // check output of hook to ensure its a stable object
@@ -10298,6 +10526,12 @@ describe("useQuery Hook", () => {
 
       expect(cache.readQuery({ query })).toEqual({ hello: "hello 1" });
 
+      // Synchronously unmount + remount. With shared `ObservableQuery`
+      // deduplication (matching the lifecycle of `useFragment`,
+      // `useSuspenseQuery`, etc.), the disposer is deferred a microtask so
+      // that the remount can re-attach to the still-alive observable instead
+      // of tearing it down and creating a fresh `network-only` request.
+      // This means `helloCount` is NOT incremented across the remount.
       act(() => {
         setShow(false);
       });
@@ -10307,20 +10541,7 @@ describe("useQuery Hook", () => {
       });
 
       expect(result.current).toStrictEqualTyped({
-        data: undefined,
-        dataState: "empty",
-        loading: true,
-        networkStatus: NetworkStatus.loading,
-        previousData: undefined,
-        variables: {},
-      });
-
-      await waitFor(() => {
-        expect(result.current.loading).toBe(false);
-      });
-
-      expect(result.current).toStrictEqualTyped({
-        data: { hello: "hello 2" },
+        data: { hello: "hello 1" },
         dataState: "complete",
         loading: false,
         networkStatus: NetworkStatus.ready,
@@ -10328,7 +10549,7 @@ describe("useQuery Hook", () => {
         variables: {},
       });
 
-      expect(cache.readQuery({ query })).toEqual({ hello: "hello 2" });
+      expect(cache.readQuery({ query })).toEqual({ hello: "hello 1" });
     });
   });
 

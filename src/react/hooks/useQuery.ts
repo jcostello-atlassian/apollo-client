@@ -40,10 +40,15 @@ import type {
   VariablesOption,
 } from "@apollo/client/utilities/internal";
 import {
+  canonicalStringify,
   maybeDeepFreeze,
   mergeOptions,
   variablesUnknownSymbol,
 } from "@apollo/client/utilities/internal";
+
+import type { SharedObservableQueryRef } from "../internal/cache/SharedObservableQueryCache.js";
+import { getSharedObservableQueryCache } from "../internal/cache/SharedObservableQueryCache.js";
+import type { CacheKey } from "../internal/cache/types.js";
 
 import type { SkipToken } from "./constants.js";
 import { skipToken } from "./constants.js";
@@ -102,6 +107,8 @@ export declare namespace useQuery {
 
       /** {@inheritDoc @apollo/client!QueryOptionsDocumentation#skip:member} */
       skip?: boolean;
+
+      queryKey?: string | number | any[];
     }
   }
   export type Options<
@@ -234,6 +241,9 @@ interface InternalState<TData, TVariables extends OperationVariables> {
   query: DocumentNode | TypedDocumentNode<TData, TVariables>;
   observable: ObsQueryWithMeta<TData, TVariables>;
   resultData: InternalResult<TData>;
+  sharedRef: SharedObservableQueryRef & {
+    observable: ObservableQuery<TData, TVariables>;
+  };
 }
 
 /**
@@ -410,7 +420,7 @@ function useQuery_<TData, TVariables extends OperationVariables>(
   const client = useApolloClient(
     typeof options === "object" ? options.client : undefined
   );
-  const { ssr } = typeof options === "object" ? options : {};
+  const { ssr, queryKey } = typeof options === "object" ? options : {};
 
   const watchQueryOptions = useOptions(
     query,
@@ -418,15 +428,39 @@ function useQuery_<TData, TVariables extends OperationVariables>(
     client.defaultOptions.watchQuery
   );
 
+  const sharedCache = getSharedObservableQueryCache(client);
+
+  const canonicalVariables = canonicalStringify(watchQueryOptions.variables);
+  let [cacheKeyVariables, setCacheKeyVariables] =
+    React.useState(canonicalVariables);
+  if (options !== skipToken && cacheKeyVariables !== canonicalVariables) {
+    setCacheKeyVariables((cacheKeyVariables = canonicalVariables));
+  }
+
+  // Look up or lazily create the shared ObservableQuery for the current
+  // cache key on every render.
+  const nextSharedRef = sharedCache.getRef<TData, TVariables>(
+    [
+      query,
+      cacheKeyVariables,
+      ...([] as any[]).concat(queryKey ?? []),
+    ] satisfies CacheKey,
+    () => client.watchQuery(watchQueryOptions)
+  );
+
   function createState(
     previous?: InternalState<TData, TVariables>
   ): InternalState<TData, TVariables> {
-    const observable = client.watchQuery(watchQueryOptions);
+    const observable = nextSharedRef.observable as ObsQueryWithMeta<
+      TData,
+      TVariables
+    >;
 
     return {
       client,
       query,
       observable,
+      sharedRef: nextSharedRef,
       resultData: {
         current: observable.getCurrentResult(),
         // Reuse previousData from previous InternalState (if any) to provide
@@ -439,17 +473,26 @@ function useQuery_<TData, TVariables extends OperationVariables>(
 
   let [state, setState] = React.useState(createState);
 
-  if (client !== state.client || query !== state.query) {
-    // If the client or query have changed, we need to create a new InternalState.
-    // This will trigger a re-render with the new state, but it will also continue
-    // to run the current render function to completion.
-    // Since we sometimes trigger some side-effects in the render function, we
-    // re-assign `state` to the new state to ensure that those side-effects are
-    // triggered with the new state.
+  if (
+    client !== state.client ||
+    query !== state.query ||
+    state.sharedRef.key !== nextSharedRef.key ||
+    state.sharedRef.isDisposed
+  ) {
+    // If the client/query identity changed, the shared ref identity changed,
+    // or the previous shared ref was disposed between render passes, we need
+    // to create a new InternalState. This will trigger a re-render with the
+    // new state, but it will also continue to run the current render
+    // function to completion. Since we sometimes trigger some side-effects
+    // in the render function, we re-assign `state` to the new state to
+    // ensure those side-effects are triggered with the new state.
     setState((state = createState(state)));
   }
 
-  const { observable, resultData } = state;
+  const { observable, resultData, sharedRef } = state;
+
+  // Retain the shared observable for the lifetime of this hook instance.
+  React.useEffect(() => sharedRef.retain(), [sharedRef]);
 
   useInitialFetchPolicyIfNecessary<TData, TVariables>(
     watchQueryOptions,
@@ -512,8 +555,13 @@ function useOptions<TData, TVariables extends OperationVariables>(
       return opts;
     }
 
+    const { queryKey: _ignoredQueryKey, ...optionsWithoutQueryKey } = options;
+
     const watchQueryOptions: ApolloClient.WatchQueryOptions<TData, TVariables> =
-      mergeOptions(defaultOptions as any, { ...options, query });
+      mergeOptions(defaultOptions as any, {
+        ...optionsWithoutQueryKey,
+        query,
+      });
 
     if (options.skip) {
       watchQueryOptions.initialFetchPolicy =

@@ -1,5 +1,10 @@
 import type { InternalTypes as ReactInternalTypes } from "@apollo/client/react";
 export { getSuspenseCache } from "./cache/getSuspenseCache.js";
+export {
+  getSharedObservableQueryCache,
+  SharedObservableQueryCache,
+  SharedObservableQueryRef,
+} from "./cache/SharedObservableQueryCache.js";
 export type { CacheKey, FragmentKey, QueryKey } from "./cache/types.js";
 export type { PreloadedQueryRef, QueryRef } from "./cache/QueryReference.js";
 export {
